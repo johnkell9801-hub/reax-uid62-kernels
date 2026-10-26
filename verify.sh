@@ -5,7 +5,12 @@
 # usage: ./verify.sh <nvcc 13.4>      needs: crane, tar, sha256sum, od, docker (for ftokc.so: ubuntu:24.04 gcc 13.3)
 set -e
 NVCC134=${1:?path to nvcc 13.4}
-case $NVCC134 in /*) ;; *) NVCC134=$(command -v "$NVCC134" || echo "$PWD/$NVCC134");; esac
+case $NVCC134 in
+  /*) ;;
+  */*) NVCC134=$PWD/$NVCC134;;
+  *) NVCC134=$(command -v "$NVCC134") || { echo "nvcc not found: $1"; exit 1; };;
+esac
+"$NVCC134" --version | tail -n 2
 HERE=$(cd "$(dirname "$0")" && pwd)
 IMG=ghcr.io/masterdev777/s1r
 REF=$IMG@sha256:8467e642812347a6c34f5c3f26eb7dd42678e4a4a532aad09f3d22d9fa0138a7
@@ -16,17 +21,43 @@ onormpv.cubin ngemm9b_trow.cubin ngemm9t_trow.cubin ngemm7_trow.cubin ngr_trow.c
 kf_trow.cubin kfx_trow.cubin ngemm8.cubin ngemm7n.cubin ngemm7w.cubin ngemm7wn.cubin q8.cubin q8k.cubin \
 q8pb.cubin q8f2.cubin q8ri.cubin q8rf.cubin onormpvq.cubin onormpvqn.cubin q8gq.cubin q8h2.cubin ftokc.so"
 W=$(mktemp -d)
-trap 'rm -rf "$W"' EXIT
+MADE=""   # folders build_inplace created under /opt (removed again on exit)
+trap 'rm -rf "$W"; for d in $MADE; do rmdir "$d" 2>/dev/null || true; done' EXIT
 FAIL=0; NCOPY=0; NSAME=0; NELF=0
 crane manifest "$REF" > "$W/manifest.json" 2>/dev/null || true
 [ "sha256:$(sha256sum < "$W/manifest.json" | cut -d' ' -f1)" = "${REF#*@}" ] ||
   { echo "cannot read the manifest of $REF (crane / network?)"; exit 1; }
+[ "$(grep -o 'sha256:[0-9a-f]\{64\}' "$W/manifest.json" | wc -l)" -eq 18 ] ||
+  { echo "$REF does not have 17 layers"; exit 1; }
+RT="sha256:41140838cd967104f816a16f4132acefcc18315b8585b5918eaed7dbf9e164c1
+sha256:794c52e812b3bc4775dfd0ead04207d6ce98b422d61b32a0b52806bf1626985e
+sha256:f4d2483a1161e0819610d3d675d7b81aa685c0f0e5e21eaf2da47c8ce92f58d2
+sha256:bcc8fa79bf4cf0a65041e3a34b6b32e14966c0074879c370adc01a51cc8e0cea
+sha256:e74503aa74b89a0672f0692f38a476994c4ce4ac1abba10d345a323a78a2a821
+sha256:5e534237acda9cd336ace46c8bcf53303b200d6c70ce30a5e0346a479fc0e467
+sha256:5f9728c239eea0750cda8725b189a498f1fd7e91491652ed97753f87a53cdd30
+sha256:415e807e3ba1d5e37088342dbbaa0b15514f759b0a6b73f00b9c26be6d69ea33
+sha256:ec1101e9317f072ac2baf9f43b520b3515b68d3573bc9720bd124621c3c83434
+sha256:512cef068237d2bb765c52e8c811d80566c4d2b7f6916c04552b40d5b1f6df48
+sha256:7124aa5c534f67fa2e5310e67db171481d28093022be8fb464a51fab5f882fef
+sha256:82755c54b1adaea97b7950063722e05fda99e3a6302a5f4bbdcbe825a8122e41
+sha256:e50138bd3125f743baae54c8802f35cb244e2bec5b9256d9feea5c5d7e99fe50
+sha256:fa0077ecac0e5cea6a1186d178d2a022346411fafe7fb5d7c0a2ca364b2722f7
+sha256:c1e007f2186caa28a555a15e7572c5219e454243abcc43d5fcbd53681db78990"
+i=0
+for d in $RT; do  # layers 1-15 = the official runtime image (ghcr.io/reaxlabs/reax-s1-fast-runtime:1.2.0-rc1, sha256:d857a90eaf168d1d...)
+  i=$((i + 1))
+  [ "$(grep -o 'sha256:[0-9a-f]\{64\}' "$W/manifest.json" | sed -n "$((i + 1))p")" = "$d" ] ||
+    { echo "layer $i of $REF is not the official runtime layer $d"; exit 1; }
+done
 layer() {  # layer <n> <digest>: the manifest's n-th layer; check the blob's sha256 and unpack it into $W/L<n>
   [ "$(grep -o 'sha256:[0-9a-f]\{64\}' "$W/manifest.json" | sed -n "$(($1 + 1))p")" = "$2" ] ||
     { echo "layer $1 of $REF is not $2"; exit 1; }
   crane blob "$IMG@$2" > "$W/blob" 2>/dev/null || true
   [ "sha256:$(sha256sum < "$W/blob" | cut -d' ' -f1)" = "$2" ] || { echo "layer $1 ($2) did not download (crane / network?)"; exit 1; }
-  mkdir -p "$W/L$1" && tar -xzf "$W/blob" -C "$W/L$1" && rm -f "$W/blob"
+  mkdir -p "$W/L$1"
+  tar -xzf "$W/blob" -C "$W/L$1" || { echo "layer $1 ($2) did not unpack"; exit 1; }
+  rm -f "$W/blob"
   [ -n "$(ls -A "$W/L$1/opt/s1eng" 2>/dev/null)" ] || { echo "layer $1 ($2) did not unpack"; exit 1; }
 }
 layer 16 sha256:585c22a8c1b0917c0a66de67685668fa58d4d8b817d614385e522f7213aa9d5f
@@ -37,17 +68,25 @@ build() {  # build <nvcc> <log> <args...>
   if ! "$nv" "$@" > "$log" 2>&1; then echo "build failed: $nv $*"; tail -20 "$log"; exit 1; fi
 }
 build_inplace() {  # build_inplace <nvcc> <binary> <args>: byte-identical only from /opt/s1eng/s1eng (path CRC in a symbol)
-  if mkdir -p /opt/s1eng/s1eng 2>/dev/null && [ -w /opt/s1eng/s1eng ] && [ ! -e /opt/s1eng/s1eng/onorm.cu ]; then
-    cp "$HERE"/*.cu "$HERE"/*.h /opt/s1eng/s1eng/ && (cd /opt/s1eng/s1eng && "$1" $3 > /dev/null 2>&1) &&
-      cp "/opt/s1eng/s1eng/$2" "$W/b/$2" && rm -f /opt/s1eng/s1eng/*.cu /opt/s1eng/s1eng/*.h "/opt/s1eng/s1eng/$2"
-  else
-    echo "($2: /opt/s1eng/s1eng not usable here; built in the scratch folder: only .strtab / symbol tables differ, expect DIFFERS)"
-    "$1" $3 > "$2.log" 2>&1
+  if [ -z "$(ls -A /opt/s1eng/s1eng 2>/dev/null)" ]; then   # missing or empty: usable, and nothing of anyone else's is there
+    [ -e /opt/s1eng ] || MADE="/opt/s1eng/s1eng /opt/s1eng"
+    [ -e /opt/s1eng/s1eng ] || [ -n "$MADE" ] || MADE=/opt/s1eng/s1eng
+    if mkdir -p /opt/s1eng/s1eng 2>/dev/null && [ -w /opt/s1eng/s1eng ]; then
+      cp "$HERE"/*.cu "$HERE"/*.h /opt/s1eng/s1eng/
+      if (cd /opt/s1eng/s1eng && "$1" $3 > "$W/b/$2.log" 2>&1); then cp "/opt/s1eng/s1eng/$2" "$W/b/$2"; ok=1; else ok=0; fi
+      for f in "$HERE"/*.cu "$HERE"/*.h; do rm -f "/opt/s1eng/s1eng/${f##*/}"; done
+      rm -f "/opt/s1eng/s1eng/$2"
+      [ "$ok" = 1 ] || { echo "build failed (in place): $1 $3"; tail -20 "$W/b/$2.log"; exit 1; }
+      return 0
+    fi
   fi
+  echo "($2: /opt/s1eng/s1eng not usable here (not empty, or not creatable); built in the scratch folder: only .strtab / symbol tables differ, expect DIFFERS)"
+  "$1" $3 > "$2.log" 2>&1 || { echo "build failed: $1 $3"; tail -20 "$2.log"; exit 1; }
 }
 build_gcc() {  # ftokc.so with Ubuntu 24.04's gcc 13.3
-  docker run --rm -v "$W/b:/w" -w /w ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac sh -c \
-    "apt-get update -qq >/dev/null && apt-get install -y -qq gcc-13=13.3.0-6ubuntu2~24.04.1 >/dev/null 2>&1 && ln -sf /usr/bin/gcc-13 /usr/local/bin/gcc && $1"
+  docker run --rm --platform linux/amd64 -v "$W/b:/w" -w /w ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac sh -c \
+    "apt-get update -qq >/dev/null && apt-get install -y -qq gcc-13=13.3.0-6ubuntu2~24.04.1 >/dev/null 2>&1 && ln -sf /usr/bin/gcc-13 /usr/local/bin/gcc && $1" ||
+    { echo "ftokc.so: the build in docker failed (docker / apt / the gcc-13 pin 13.3.0-6ubuntu2~24.04.1)"; exit 1; }
 }
 check() {  # check <name>: the rebuilt file against every layer that has it
   [ -f "$1" ] || { echo "$1: not built"; FAIL=1; return 0; }
